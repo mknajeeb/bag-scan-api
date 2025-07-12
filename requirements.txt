@@ -1,0 +1,7 @@
+Flask
+flask-cors
+requests
+azure-cognitiveservices-vision-computervision
+SQLAlchemy
+pyodbc
+gunicorn
