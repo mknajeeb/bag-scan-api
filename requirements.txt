@@ -5,3 +5,5 @@ azure-cognitiveservices-vision-computervision
 SQLAlchemy
 pyodbc
 gunicorn
+pandas
+openpyxl
