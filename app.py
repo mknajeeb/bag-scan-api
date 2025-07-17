@@ -12,10 +12,26 @@ AZURE_ENDPOINT = "https://firstone-muhammad.cognitiveservices.azure.com/"
 AZURE_KEY      = "YOUR_AZURE_KEY_HERE"
 
 # ─── Your Rush Bag List & State ───────────────────────────────────────────────
-bag_list     = ["Allie Gorti", "Danielle Marshall", "Hugh Cochran"]
+bag_list     = []  # will be populated on import-data
 scanned_bags = []
 
-# ─── 1) Status Endpoint ──────────────────────────────────────────────────────
+# ─── 0.5) GET /import-data (initialize bag_list)
+@app.route("/import-data", methods=["POST"])
+def import_data():
+    global bag_list, scanned_bags
+    scanned_bags = []
+    try:
+        # load your Excel into bag_list
+        import pandas as pd, os, re, time
+        xlsx_path = os.path.join(os.getcwd(), "testrunrinse.xlsx")
+        df = pd.read_excel(xlsx_path, engine="openpyxl").rename(columns=lambda x: x.strip())
+        name_col = next(c for c in df.columns if "customer" in c.lower())
+        bag_list = df[name_col].dropna().drop_duplicates().tolist()
+        return jsonify({"message": f"Imported {len(bag_list)} bags from testrunrinse.xlsx"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ─── 1) Status Endpoint ────────────────────────────────────────────────────── ──────────────────────────────────────────────────────
 @app.route("/status", methods=["GET"])
 def status():
     remaining = [n for n in bag_list if n not in scanned_bags]
@@ -104,3 +120,4 @@ def ocr():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
+
