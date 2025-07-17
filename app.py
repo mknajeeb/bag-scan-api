@@ -57,6 +57,7 @@ def load_and_prepare():
             return "Hang Dry" if w == 0 else "Wash & Fold"
         except:
             return "Hang Dry"
+
     df["Category"] = df["WF_LBS"].apply(classify_service)
     df["RushFlag"] = df.apply(lambda r: "RUSH" if (r["HasTODAY"] or r["ActualDate"] in rush_dates) else "NON-RUSH", axis=1)
 
@@ -88,6 +89,7 @@ def import_data():
                 " Category NVARCHAR(50) NOT NULL,"
                 " RushFlag NVARCHAR(10) NOT NULL,"
                 " scanned BIT NOT NULL DEFAULT 0,"
+                " scan_date DATE NULL,"
                 " lbs FLOAT NULL"
                 ");"))
             insert_sql = text(
@@ -120,9 +122,13 @@ def scan():
             ).first()
             if not row:
                 return jsonify({"error":f"Unknown QR: {qr}"}),400
-            if conn.execute(text("SELECT scanned FROM dbo.bags WHERE id=:id"),{"id":row.id}).scalar():
+            existing = conn.execute(text("SELECT scanned FROM dbo.bags WHERE id=:id"),{"id":row.id}).scalar()
+            if existing:
                 return jsonify({"error":"Bag already scanned."}),400
-            conn.execute(text("UPDATE dbo.bags SET scanned=1 WHERE id=:id"),{"id":row.id})
+            # mark scanned and record scan_date
+            conn.execute(text(
+                "UPDATE dbo.bags SET scanned=1, scan_date=CONVERT(date,GETDATE()) WHERE id=:id"
+            ),{"id":row.id})
     except SQLAlchemyError as e:
         tb = traceback.format_exc()
         app.logger.error("Scan failed:\n%s", tb)
@@ -134,13 +140,24 @@ def scan():
 def list_bags():
     try:
         rows = engine.execute(text(
-            "SELECT id,Customer,QR,Category,RushFlag,scanned FROM dbo.bags ORDER BY id"
+            "SELECT id,Customer,QR,Category,RushFlag,scanned,scan_date,lbs FROM dbo.bags ORDER BY id"
         )).fetchall()
-        data = [{"id":r.id,"customer":r.Customer,"qr":r.QR,"category":r.Category,"rush":r.RushFlag,"scanned":bool(r.scanned)} for r in rows]
+        data = [
+            {
+                "id":r.id,
+                "customer":r.Customer,
+                "qr":r.QR,
+                "category":r.Category,
+                "rush":r.RushFlag,
+                "scanned":bool(r.scanned),
+                "scan_date":r.scan_date.strftime("%Y-%m-%d") if r.scan_date else None,
+                "lbs":r.lbs
+            }
+            for r in rows
+        ]
     except Exception as e:
         return jsonify({"error":str(e)}),500
     return jsonify({"bags":data}),200
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=5001,debug=True)
-
