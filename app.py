@@ -19,18 +19,27 @@ logging.basicConfig(level=logging.DEBUG)
 app.logger.setLevel(logging.DEBUG)
 
 # ─── DATABASE CONFIG ─────────────────────────────────────────────────────────
-# Ensure SQLAZURE is set in App Service configuration
-conn_str = os.environ.get("SQLAZURE")
-if not conn_str:
-    app.logger.error("Missing SQLAZURE environment variable")
-    raise RuntimeError("Missing SQLAZURE environment variable")
+# Attempt to read the connection string from App Settings (Application settings or Connection strings)
+# If you set a Connection string named "SQLAZURE" under "Connection strings" of type "SQLAzure",
+# Azure will expose it as an env var named "SQLAZURECONNSTR_SQLAZURE".
+raw_conn = os.environ.get("SQLAZURE") or os.environ.get("SQLAZURECONNSTR_SQLAZURE")
+if not raw_conn:
+    app.logger.error("Missing SQLAZURE connection string. Check App Service configuration.")
+    raise RuntimeError("Missing SQLAZURE connection string")
+
+# URL-encode if necessary
+from urllib.parse import quote_plus
+conn_str = quote_plus(raw_conn)
 engine = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
 
-# Excel file location
-INPUT_FILE = "testrunrinse.xlsx"
+# Excel file location (ensure you also include it in your deployment)
+INPUT_FILE = os.path.join(os.getcwd(), "testrunrinse.xlsx")
 
 # ─── HELPER: Load & Prepare Excel ─────────────────────────────────────────────
 def load_and_prepare():
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(f"Excel file not found at {INPUT_FILE}")
+
     df = pd.read_excel(INPUT_FILE, engine="openpyxl")
     df.columns = [c.strip() for c in df.columns]
 
@@ -61,7 +70,7 @@ def load_and_prepare():
 
     # Determine RushFlag
     df["RushFlag"] = df.apply(
-        lambda r: "RUSH" if r["HasTODAY"] or r["Actual_Date"] in rush_dates else "NON-RUSH",
+        lambda r: "RUSH" if (r["HasTODAY"] or r["Actual_Date"] in rush_dates) else "NON-RUSH",
         axis=1
     )
 
@@ -77,31 +86,28 @@ def import_data():
         app.logger.error("Excel load failed:\n%s", tb)
         return jsonify({"error": "Excel load failed", "details": str(e)}), 500
 
-    total_rows   = len(df)
-    rush_count   = int((df["RushFlag"] == "RUSH").sum())
-    nonrush_count= total_rows - rush_count
-    hangdry_count= int((df["Category"] == "Hang Dry").sum())
+    total_rows    = len(df)
+    rush_count    = int((df["RushFlag"] == "RUSH").sum())
+    nonrush_count = int((df["RushFlag"] == "NON-RUSH").sum())
+    hangdry_count = int((df["Category"] == "Hang Dry").sum())
 
     try:
         with engine.begin() as conn:
-            # Create table if missing
-            conn.execute(text("""
-                IF OBJECT_ID('dbo.bags','U') IS NULL
-                CREATE TABLE dbo.bags(
-                  id INT IDENTITY(1,1) PRIMARY KEY,
-                  Customer NVARCHAR(200) NOT NULL,
-                  Category NVARCHAR(50) NOT NULL,
-                  RushFlag NVARCHAR(10) NOT NULL,
-                  scanned BIT DEFAULT 0,
-                  scan_date DATE NULL,
-                  lbs FLOAT NULL
-                );
-            """))
+            # Create / recreate table
+            conn.execute(text("DROP TABLE IF EXISTS dbo.bags;"))
+            conn.execute(text(
+                "CREATE TABLE dbo.bags("
+                " id INT IDENTITY(1,1) PRIMARY KEY,"
+                " Customer NVARCHAR(200) NOT NULL,"
+                " Category NVARCHAR(50) NOT NULL,"
+                " RushFlag NVARCHAR(10) NOT NULL,"
+                " scanned BIT DEFAULT 0,"
+                " scan_date DATE NULL,"
+                " lbs FLOAT NULL"
+                ");"
+            ))
 
-            # Truncate existing data
-            conn.execute(text("TRUNCATE TABLE dbo.bags"))
-
-            # Bulk insert all rows
+            # Bulk insert
             insert_sql = text(
                 "INSERT INTO dbo.bags(Customer, Category, RushFlag, scanned, scan_date, lbs)"
                 " VALUES(:c, :cat, :r, 0, NULL, NULL)"
