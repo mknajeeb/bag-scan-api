@@ -1,160 +1,121 @@
 # app.py
-
-import os
-import re
-import time
+import os, re, time
 import pandas as pd
-from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 from flask_cors import CORS
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError
 
+# ─── App + CORS ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-# Azure Computer Vision (unused here but kept for OCR endpoint if you wish)
-AZURE_ENDPOINT = "https://firstone-muhammad.cognitiveservices.azure.com/"
-AZURE_KEY      = os.getenv("AZURE_KEY", "YOUR_KEY_HERE")
-
-# Database via env var in App Service → Configuration → Connection strings
-conn_str = os.environ["SQLAZURE"]   # e.g. "Driver={ODBC Driver 18 for SQL Server};Server=...;Database=...;UID=...;PWD=..."
+# ─── DB SETUP ─────────────────────────────────────────────────────────────────
+# Make sure in Azure’s App Settings you have:
+#   Name=SQLAZURE  Value=Driver={ODBC Driver 18 for SQL Server};Server=tcp:…;Database=…;Uid=…;Pwd=REAL_PASSWORD;Encrypt=yes;TrustServerCertificate=no;
+conn_str = os.environ["SQLAZURE"]
 engine   = create_engine(f"mssql+pyodbc:///?odbc_connect={conn_str}")
 
-# ─── 1) STATUS ─────────────────────────────────────────────────────────────────
-@app.route("/status", methods=["GET"])
-def status():
-    """Return counts of total, scanned, remaining."""
-    with engine.connect() as conn:
-        total   = conn.execute(text("SELECT COUNT(*) FROM dbo.bags")).scalar()
-        scanned = conn.execute(text("SELECT COUNT(*) FROM dbo.bags WHERE scanned=1")).scalar()
-    remaining = total - scanned
-    return jsonify({
-        "total":     total,
-        "scanned":   scanned,
-        "remaining": remaining
-    })
+# ─── EXCEL → CSV IMPORT LOGIC ─────────────────────────────────────────────────
+INPUT_FILE  = "testrunrinse.xlsx"
 
-# ─── 2) LIST ALL BAGS ──────────────────────────────────────────────────────────
-@app.route("/bags", methods=["GET"])
-def list_bags():
-    """Return full list of bags with their scan, rush & category flags."""
-    rows = []
-    with engine.connect() as conn:
-        result = conn.execute(text("""
-            SELECT name, scanned, scan_date, lbs, category, rush
-              FROM dbo.bags
-              ORDER BY name
-        """))
-        for r in result:
-            rows.append({
-                "name":     r.name,
-                "scanned":  bool(r.scanned),
-                "scan_date": r.scan_date.isoformat() if r.scan_date else None,
-                "lbs":      float(r.lbs) if r.lbs is not None else None,
-                "category": r.category,
-                "rush":     bool(r.rush)
-            })
-    return jsonify({"bags": rows})
+def load_and_prepare():
+    df = pd.read_excel(INPUT_FILE)
+    # normalize headers
+    df.columns = [c.strip() for c in df.columns]
 
-# ─── 3) IMPORT‐DATA ─────────────────────────────────────────────────────────────
+    # identify columns
+    date_col = next(c for c in df if "date" in c.lower())
+    name_col = next(c for c in df if "customer" in c.lower())
+    wf_col   = next(c for c in df if "wf" in c.lower() or "lbs" in c.lower())
+
+    # select & rename
+    df = df[[date_col, name_col, wf_col]]
+    df.columns = ["Date", "Customer", "WF_LBS"]
+
+    # drop rows missing both
+    df = df.dropna(subset=["Date", "Customer"], how="all")
+
+    # classify Category
+    def classify_service(val):
+        s = str(val).strip()
+        if s.isdigit() or float(s or 0) == 0:
+            return "Hang Dry"
+        return "Wash & Fold"
+    df["Category"] = df["WF_LBS"].apply(classify_service)
+
+    # mark if row has TODAY token
+    df["HasTODAY"] = df["Date"].astype(str).str.upper().str.contains("TODAY")
+
+    # extract the bare date string (for comparison)
+    df["BareDate"] = df["Date"].astype(str).replace(r".*TODAY\s*","", regex=True).str.strip()
+
+    # compute all rush-dates (any row where HasTODAY is True)
+    rush_dates = set(df.loc[df["HasTODAY"], "BareDate"])
+
+    # final Rush flag
+    def is_rush(row):
+        if row["HasTODAY"]:
+            return "RUSH"
+        # also if its date matches any rush date
+        if row["BareDate"] in rush_dates:
+            return "RUSH"
+        return "NON-RUSH"
+    df["RushFlag"] = df.apply(is_rush, axis=1)
+
+    return df
+
+# ─── ENDPOINT: /import-data ───────────────────────────────────────────────────
 @app.route("/import-data", methods=["POST"])
 def import_data():
-    """
-    Truncate dbo.bags, re‑load Excel, classify each row, insert,
-    then return summary counts.
-    """
-    # 1) Load & clean Excel
-    INPUT_FILE = "testrunrinse.xlsx"
-    df = pd.read_excel(INPUT_FILE)
-    df = df.rename(columns=lambda x: x.strip())
-    # pick our three columns
-    date_col = [c for c in df.columns if "date" in c.lower()][0]
-    name_col = [c for c in df.columns if "customer" in c.lower()][0]
-    wf_col   = [c for c in df.columns if "wf" in c.lower() or "lbs" in c.lower()][0]
-    df = df[[date_col, name_col, wf_col]]
-    df.columns = ["Date", "Customer Name", "# WF LBS"]
-    df = df.dropna(subset=["Date", "Customer Name"])
+    try:
+        df = load_and_prepare()
+    except Exception as e:
+        return jsonify({"error": f"Excel load failed: {e}"}), 500
 
-    # 2) Identify rush dates (any row with literal “TODAY”)
-    df["Actual_Date"] = df["Date"].astype(str).apply(
-        lambda s: re.sub(r"\s*TODAY\s*", "", s, flags=re.IGNORECASE).strip()
-    )
-    df["Has_Today"] = df["Date"].astype(str).str.upper().str.contains("TODAY")
-    rush_dates = set(df.loc[df["Has_Today"], "Actual_Date"])
+    total = len(df)
+    rush_cnt = int((df["RushFlag"]=="RUSH").sum())
+    nonrush_cnt = total - rush_cnt
+    hangdry_cnt = int((df["Category"]=="Hang Dry").sum())
 
-    # 3) Service classification
-    def classify_service(val):
-        t = str(val).strip()
-        # numeric → wash & fold; zero or fail parse → hang dry
-        try:
-            _ = float(t)
-            return "Wash and Fold"
-        except:
-            return "Hang Dry"
-
-    # 4) TRUNCATE table
     with engine.begin() as conn:
+        # 1) ensure table has an IDENTITY PK
+        conn.execute(text("""
+        IF OBJECT_ID('dbo.bags','U') IS NULL
+          CREATE TABLE dbo.bags(
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            Customer NVARCHAR(200),
+            Category NVARCHAR(50),
+            RushFlag NVARCHAR(10)
+          );
+        """))
+
+        # 2) truncate before reload
         conn.execute(text("TRUNCATE TABLE dbo.bags"))
 
-    # 5) Insert rows, tallying metrics
-    rush_count    = 0
-    nonrush_count = 0
-    hangdry_count = 0
-    inserted      = 0
-
-    insert_sql = text("""
-      INSERT INTO dbo.bags
-        (name, scanned, scan_date, lbs, category, rush)
-      VALUES
-        (:name, 0, :dt, :lbs, :cat, :rush)
-    """)
-
-    with engine.begin() as conn:
-        for _, row in df.iterrows():
-            name  = row["Customer Name"].strip()
-            ad    = row["Actual_Date"]
-            # parse date (MM/DD/YYYY) if possible
-            try:
-                dt = datetime.strptime(ad, "%m/%d/%Y").date()
-            except:
-                dt = None
-            # parse numeric lbs
-            try:
-                lbs = float(str(row["# WF LBS"]).upper().replace("LBS", "").strip())
-            except:
-                lbs = None
-
-            cat    = classify_service(row["# WF LBS"])
-            is_r   = (ad in rush_dates)
-
-            # metrics
-            if is_r:
-                rush_count += 1
-            else:
-                nonrush_count += 1
-            if cat == "Hang Dry":
-                hangdry_count += 1
-
-            conn.execute(insert_sql, {
-                "name": name,
-                "dt":   dt,
-                "lbs":  lbs,
-                "cat":  cat,
-                "rush": 1 if is_r else 0
-            })
-            inserted += 1
+        # 3) bulk insert
+        insert_sql = text("INSERT INTO dbo.bags(Customer,Category,RushFlag) VALUES(:c,:cat,:r)")
+        conn.execute(
+            insert_sql,
+            [
+                {"c": row.Customer, "cat": row.Category, "r": row.RushFlag}
+                for _, row in df.iterrows()
+            ]
+        )
 
     return jsonify({
-        "message":   f"Imported {inserted} rows",
-        "rush":      rush_count,
-        "non_rush":  nonrush_count,
-        "hang_dry":  hangdry_count
-    }), 200
+        "message":    f"Imported {total} rows",
+        "rush":       rush_cnt,
+        "non_rush":   nonrush_cnt,
+        "hang_dry":   hangdry_cnt
+    })
 
-# ─── MAIN ───────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # for local debugging only; in Azure we'll use gunicorn via startup.txt
+# ─── STATUS: /bags ─────────────────────────────────────────────────────────────
+@app.route("/bags", methods=["GET"])
+def get_bags():
+    rows = engine.execute(text("SELECT Customer, Category, RushFlag FROM dbo.bags")).fetchall()
+    return jsonify([{"customer":r.Customer, "category":r.Category, "rush":r.RushFlag} for r in rows])
+
+# ─── RUN ───────────────────────────────────────────────────────────────────────
+if __name__=="__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
-
