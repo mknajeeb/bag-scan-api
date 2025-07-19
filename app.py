@@ -8,23 +8,19 @@ from datetime import datetime
 
 import pandas as pd
 from flask import Flask, jsonify, request
-from flask_cors import CORS
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-
-# ─── APP SETUP ───────────────────────────────────────────────────────────────
-# Try to import flask-cors; skip if not available
 try:
     from flask_cors import CORS
 except ImportError:
     CORS = None
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
+# ─── APP SETUP ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
 if CORS:
     CORS(app)
 else:
     app.logger.warning("flask_cors not installed, skipping CORS")
-CORS(app)
 logging.basicConfig(level=logging.DEBUG)
 app.logger.setLevel(logging.DEBUG)
 
@@ -46,19 +42,40 @@ def load_and_prepare():
     df = pd.read_excel(INPUT_FILE, engine="openpyxl")
     df.columns = [c.strip() for c in df.columns]
 
+    # identify columns
     date_col = next(c for c in df.columns if "date" in c.lower())
     name_col = next(c for c in df.columns if "customer" in c.lower())
     qr_col = next((c for c in df.columns if "qr" in c.lower()), None)
-    wf_col = next(c for c in df.columns if "wf" in c.lower() or "lbs" in c.lower())
+    wf_col = next((c for c in df.columns if "wf" in c.lower() or "lbs" in c.lower()), None)
 
-    df = df[[date_col, name_col, qr_col, wf_col]].dropna(subset=[date_col, name_col, qr_col]).copy()
-    df.columns = ["Date", "Customer", "QR", "WF_LBS"]
+    # select only needed cols, guard against missing qr or wf
+    cols_to_select = [date_col, name_col]
+    if wf_col:
+        cols_to_select.append(wf_col)
+    else:
+        raise KeyError("Could not find weight column (wf or lbs) in Excel")
+    if qr_col is not None:
+        cols_to_select.insert(2, qr_col)
+    df = df[cols_to_select].dropna(subset=[date_col, name_col]).copy()
 
+    # rename
+    new_cols = ["Date", "Customer"]
+    if qr_col is not None:
+        new_cols.append("QR")
+    new_cols.append("WF_LBS")
+    df.columns = new_cols
+
+    # if no QR, auto-generate unique IDs
+    if qr_col is None:
+        df["QR"] = df.reset_index().apply(lambda r: f"{int(datetime.utcnow().timestamp())}-{r.name}", axis=1)
+
+    # clean and detect rush
     df["RawDate"] = df["Date"].astype(str)
-    df["ActualDate"] = df["RawDate"].replace(r"\s*TODAY\s*", "", regex=True)
+    df["ActualDate"] = df["RawDate"].str.replace(r"\s*TODAY\s*", "", regex=True)
     df["HasTODAY"] = df["RawDate"].str.upper().str.contains("TODAY")
     rush_dates = set(df.loc[df["HasTODAY"], "ActualDate"])
 
+    # classify
     def classify_service(val):
         s = str(val).upper().replace("LBS", "").strip()
         try:
@@ -70,8 +87,9 @@ def load_and_prepare():
     df["Category"] = df["WF_LBS"].apply(classify_service)
     df["RushFlag"] = df.apply(
         lambda r: "RUSH" if (r["HasTODAY"] or r["ActualDate"] in rush_dates) else "NON-RUSH",
-        axis=1,
+        axis=1
     )
+
     return df
 
 # ─── ENDPOINT: IMPORT & REFRESH ───────────────────────────────────────────────
@@ -91,19 +109,7 @@ def import_data():
 
     try:
         with engine.begin() as conn:
-            conn.execute(text("IF OBJECT_ID('dbo.bags','U') IS NOT NULL DROP TABLE dbo.bags;"))
-            conn.execute(text(
-                "CREATE TABLE dbo.bags("
-                " id INT IDENTITY(1,1) PRIMARY KEY,"
-                " Customer NVARCHAR(200) NOT NULL,"
-                " QR NVARCHAR(200) NOT NULL UNIQUE,"
-                " Category NVARCHAR(50) NOT NULL,"
-                " RushFlag NVARCHAR(10) NOT NULL,"
-                " scanned BIT NOT NULL DEFAULT 0,"
-                " scan_date DATE NULL,"
-                " lbs FLOAT NULL"
-                ");"
-            ))
+            conn.execute(text("TRUNCATE TABLE dbo.bags;"))
             insert_sql = text(
                 "INSERT INTO dbo.bags(Customer, QR, Category, RushFlag, scanned, lbs)"
                 " VALUES(:cust,:qr,:cat,:rush,0,:lbs)"
@@ -136,19 +142,14 @@ def scan():
     try:
         with engine.begin() as conn:
             row = conn.execute(
-                text("SELECT id,Customer FROM dbo.bags WHERE QR=:qr"), {"qr": qr}
+                text("SELECT id,Customer,scanned FROM dbo.bags WHERE QR=:qr"), {"qr": qr}
             ).first()
             if not row:
                 return jsonify({"error": f"Unknown QR: {qr}"}), 400
-            existing = conn.execute(
-                text("SELECT scanned FROM dbo.bags WHERE id=:id"), {"id": row.id}
-            ).scalar()
-            if existing:
+            if row.scanned:
                 return jsonify({"error": "Bag already scanned."}), 400
             conn.execute(
-                text(
-                    "UPDATE dbo.bags SET scanned=1, scan_date=CONVERT(date,GETDATE()) WHERE id=:id"
-                ), {"id": row.id}
+                text("UPDATE dbo.bags SET scanned=1, scan_date=CONVERT(date,GETDATE()) WHERE id=:id"), {"id": row.id}
             )
     except SQLAlchemyError as e:
         tb = traceback.format_exc()
@@ -162,21 +163,19 @@ def list_bags():
     try:
         rows = engine.execute(
             text(
-                "SELECT Customer, Category, RushFlag, scanned, scan_date, lbs "
-                "FROM dbo.bags ORDER BY id"
+                "SELECT Customer, Category, RushFlag, scanned, scan_date, lbs FROM dbo.bags ORDER BY id"
             )
         ).fetchall()
-        data = [
-            {
+        data = []
+        for r in rows:
+            data.append({
                 "customer": r.Customer,
                 "category": r.Category,
                 "rush": r.RushFlag,
                 "scanned": bool(r.scanned),
                 "scan_date": r.scan_date.strftime("%Y-%m-%d") if r.scan_date else None,
                 "lbs": r.lbs,
-            }
-            for r in rows
-        ]
+            })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     return jsonify({"bags": data}), 200
